@@ -37,6 +37,7 @@ jobs:
         with:
           node-version: 20
           cache: "npm"
+          cache-dependency-path: package-lock.json
 
       - name: Setup Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -66,7 +67,7 @@ jobs:
             wget
 
       - name: Install Node dependencies
-        run: npm install
+        run: npm ci
 
       - name: Build frontend assets
         run: npm run build
