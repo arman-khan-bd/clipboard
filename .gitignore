@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Build outputs
+dist/
+dist-portable/
+src-tauri/target/
+src-tauri/gen/
+
+# Environment and IDE
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+.idea/

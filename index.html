@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ClipStore - Clipboard Manager</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div id="app" class="app-container">
+      <!-- Title Bar / Header -->
+      <header class="app-header" data-tauri-drag-region>
+        <div class="header-left" data-tauri-drag-region>
+          <div class="app-logo">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path>
+              <rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect>
+              <path d="M9 12h6"></path>
+              <path d="M9 16h6"></path>
+            </svg>
+          </div>
+          <span class="app-title" data-tauri-drag-region>ClipStore</span>
+          <span id="clip-count-badge" class="count-badge">0 items</span>
+        </div>
+        <div class="header-right">
+          <button id="btn-toggle-pause" class="icon-btn" title="Pause / Resume Clipboard Monitoring">
+            <svg id="icon-pause" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"></circle>
+              <line x1="10" y1="15" x2="10" y2="9"></line>
+              <line x1="14" y1="15" x2="14" y2="9"></line>
+            </svg>
+          </button>
+          <button id="btn-settings" class="icon-btn" title="Settings">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="3"></circle>
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+            </svg>
+          </button>
+          <button id="btn-close" class="icon-btn close-btn" title="Close (Esc)">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="18" y1="6" x2="6" y2="18"></line>
+              <line x1="6" y1="6" x2="18" y2="18"></line>
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      <!-- Search Section -->
+      <div class="search-section">
+        <div class="search-box">
+          <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="8"></circle>
+            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+          </svg>
+          <input type="text" id="search-input" placeholder="Search history... (Ctrl+F)" autocomplete="off" spellcheck="false" />
+          <button id="btn-clear-search" class="clear-search-btn" title="Clear Search" style="display: none;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="18" y1="6" x2="6" y2="18"></line>
+              <line x1="6" y1="6" x2="18" y2="18"></line>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- Filter Tabs -->
+      <nav class="filter-tabs">
+        <button class="filter-tab active" data-filter="all">All</button>
+        <button class="filter-tab" data-filter="pinned">
+          <span>📌 Pinned</span>
+          <span id="pinned-count-chip" class="tab-badge">0</span>
+        </button>
+        <button class="filter-tab" data-filter="code">💻 Code</button>
+        <button class="filter-tab" data-filter="link">🔗 Links</button>
+        <button class="filter-tab" data-filter="text">📝 Text</button>
+      </nav>
+
+      <!-- History Items Container -->
+      <main id="clipboard-list" class="clipboard-list" tabindex="0">
+        <!-- Rendered items will appear here -->
+      </main>
+
+      <!-- Empty State -->
+      <div id="empty-state" class="empty-state" style="display: none;">
+        <div class="empty-icon">📋</div>
+        <h3 id="empty-title">Clipboard is empty</h3>
+        <p id="empty-subtitle">Copy text anywhere and it will instantly show up here.</p>
+      </div>
+
+      <!-- Footer Bar -->
+      <footer class="app-footer">
+        <div class="footer-shortcuts">
+          <span class="key-hint"><kbd>↑</kbd><kbd>↓</kbd> Navigate</span>
+          <span class="key-hint"><kbd>Enter</kbd> Paste</span>
+          <span class="key-hint"><kbd>P</kbd> Pin</span>
+          <span class="key-hint"><kbd>Del</kbd> Delete</span>
+          <span class="key-hint"><kbd>Esc</kbd> Close</span>
+        </div>
+        <div class="footer-actions">
+          <button id="btn-clear-all" class="clear-all-btn" title="Clear All Clipboard History">Clear All</button>
+        </div>
+      </footer>
+
+      <!-- Settings Modal / Drawer -->
+      <div id="settings-modal" class="modal-overlay" style="display: none;">
+        <div class="modal-card">
+          <div class="modal-header">
+            <h3>Settings</h3>
+            <button id="btn-close-settings" class="icon-btn">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="18" y1="6" x2="6" y2="18"></line>
+                <line x1="6" y1="6" x2="18" y2="18"></line>
+              </svg>
+            </button>
+          </div>
+          <div class="modal-body">
+            <div class="setting-item">
+              <div class="setting-text">
+                <span class="setting-label">Global Shortcut</span>
+                <span class="setting-desc">Hotkey to toggle the clipboard window</span>
+              </div>
+              <select id="setting-hotkey" class="setting-select">
+                <option value="Super+V">Win + V (Windows Default)</option>
+                <option value="CommandOrControl+Shift+V">Ctrl + Shift + V (Universal)</option>
+                <option value="Alt+V">Alt + V</option>
+                <option value="CommandOrControl+Alt+V">Ctrl + Alt + V</option>
+              </select>
+            </div>
+
+            <div class="setting-item">
+              <div class="setting-text">
+                <span class="setting-label">History Capacity</span>
+                <span class="setting-desc">Maximum number of items to remember</span>
+              </div>
+              <select id="setting-capacity" class="setting-select">
+                <option value="50">50 items</option>
+                <option value="100" selected>100 items (Recommended)</option>
+                <option value="250">250 items</option>
+                <option value="500">500 items</option>
+              </select>
+            </div>
+
+            <div class="setting-item">
+              <div class="setting-text">
+                <span class="setting-label">Auto-Paste on Click</span>
+                <span class="setting-desc">Paste directly into active app when clicked</span>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="setting-auto-paste" checked />
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <div class="setting-item">
+              <div class="setting-text">
+                <span class="setting-label">Audio / Toast Feedback</span>
+                <span class="setting-desc">Show confirmation when an item is copied</span>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="setting-feedback" checked />
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <div class="setting-item">
+              <div class="setting-text">
+                <span class="setting-label">Clear Unpinned on Exit</span>
+                <span class="setting-desc">Preserve only pinned items when app closes</span>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="setting-clear-exit" />
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <div class="about-section">
+              <h4>ClipStore v1.0.0</h4>
+              <p>Lightweight Cross-Platform Clipboard Manager for Windows & Linux.</p>
+              <p class="about-hint">Runs silently in your system tray. Press <kbd>Win+V</kbd> anytime.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Toast Notification -->
+      <div id="toast" class="toast" style="display: none;">Copied to clipboard!</div>
+    </div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
