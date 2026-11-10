@@ -10,6 +10,8 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, State, WindowEvent,
 };
+
+#[cfg(not(windows))]
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,7 +38,7 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            hotkey: "Super+V".to_string(),
+            hotkey: "Win+V".to_string(),
             capacity: 100,
             auto_paste: true,
             feedback: true,
@@ -122,11 +124,208 @@ fn load_settings_from_disk(data_dir: &PathBuf) -> AppSettings {
     AppSettings::default()
 }
 
+// Windows Low-Level Keyboard Hook to guarantee Win+V works even if Explorer intercepts it
+#[cfg(windows)]
+pub mod win_hook {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::mpsc::{channel, Sender};
+    use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RMENU,
+        VK_RSHIFT, VK_RWIN, VK_SHIFT,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, DispatchMessageW, GetMessageW, SetWindowsHookExW,
+        TranslateMessage, UnhookWindowsHookEx, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYDOWN,
+        WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    };
+
+    static WIN_DOWN: AtomicBool = AtomicBool::new(false);
+    static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
+    static ALT_DOWN: AtomicBool = AtomicBool::new(false);
+    static SHIFT_DOWN: AtomicBool = AtomicBool::new(false);
+
+    // Modifier bitmask: 1 = Win, 2 = Ctrl, 4 = Alt, 8 = Shift
+    static HOTKEY_MODS: AtomicU32 = AtomicU32::new(1); // Default Win
+    static HOTKEY_KEY: AtomicU32 = AtomicU32::new(0x56); // Default 'V'
+
+    static mut HOOK_TX: Option<Sender<()>> = None;
+
+    pub fn set_hotkey(hotkey: &str) {
+        let clean = hotkey.trim().to_lowercase();
+        let mut mods = 0u32;
+        if clean.contains("win") || clean.contains("super") || clean.contains("meta") {
+            mods |= 1;
+        }
+        if clean.contains("ctrl") || clean.contains("control") || clean.contains("commandorcontrol") {
+            mods |= 2;
+        }
+        if clean.contains("alt") {
+            mods |= 4;
+        }
+        if clean.contains("shift") {
+            mods |= 8;
+        }
+
+        // Find primary key
+        let parts: Vec<&str> = clean.split('+').map(|s| s.trim()).collect();
+        let last_key = parts
+            .iter()
+            .find(|&&p| {
+                !matches!(
+                    p,
+                    "win" | "super" | "meta" | "ctrl" | "control" | "commandorcontrol" | "alt" | "shift"
+                )
+            })
+            .copied()
+            .unwrap_or("v");
+
+        let vk = match last_key {
+            "v" => 0x56,
+            "c" => 0x43,
+            "x" => 0x58,
+            "z" => 0x5A,
+            "b" => 0x42,
+            "insert" => 0x2D,
+            "space" => 0x20,
+            s if s.len() == 1 => {
+                let ch = s.chars().next().unwrap().to_ascii_uppercase();
+                ch as u32
+            }
+            _ => 0x56,
+        };
+
+        HOTKEY_MODS.store(mods, Ordering::SeqCst);
+        HOTKEY_KEY.store(vk, Ordering::SeqCst);
+    }
+
+    unsafe extern "system" fn hook_proc(code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
+        if code >= 0 {
+            let kbd = unsafe { *(l_param as *const KBDLLHOOKSTRUCT) };
+            let vk = kbd.vkCode as u16;
+            let is_down = w_param as u32 == WM_KEYDOWN || w_param as u32 == WM_SYSKEYDOWN;
+            let is_up = w_param as u32 == WM_KEYUP || w_param as u32 == WM_SYSKEYUP;
+
+            match vk {
+                VK_LWIN | VK_RWIN => {
+                    if is_down { WIN_DOWN.store(true, Ordering::SeqCst); }
+                    if is_up { WIN_DOWN.store(false, Ordering::SeqCst); }
+                }
+                VK_LCONTROL | VK_RCONTROL | VK_CONTROL => {
+                    if is_down { CTRL_DOWN.store(true, Ordering::SeqCst); }
+                    if is_up { CTRL_DOWN.store(false, Ordering::SeqCst); }
+                }
+                VK_LMENU | VK_RMENU | VK_MENU => {
+                    if is_down { ALT_DOWN.store(true, Ordering::SeqCst); }
+                    if is_up { ALT_DOWN.store(false, Ordering::SeqCst); }
+                }
+                VK_LSHIFT | VK_RSHIFT | VK_SHIFT => {
+                    if is_down { SHIFT_DOWN.store(true, Ordering::SeqCst); }
+                    if is_up { SHIFT_DOWN.store(false, Ordering::SeqCst); }
+                }
+                _ => {}
+            }
+
+            if is_down {
+                use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+                    GetAsyncKeyState, keybd_event, KEYEVENTF_KEYUP,
+                };
+
+                let req_mods = HOTKEY_MODS.load(Ordering::SeqCst);
+                let req_key = HOTKEY_KEY.load(Ordering::SeqCst) as u16;
+
+                let is_key_async_down = |vk_code: u16| -> bool {
+                    (unsafe { GetAsyncKeyState(vk_code as i32) } as u16 & 0x8000) != 0
+                };
+
+                let has_win = WIN_DOWN.load(Ordering::SeqCst)
+                    || is_key_async_down(VK_LWIN)
+                    || is_key_async_down(VK_RWIN);
+                let has_ctrl = CTRL_DOWN.load(Ordering::SeqCst)
+                    || is_key_async_down(VK_CONTROL)
+                    || is_key_async_down(VK_LCONTROL)
+                    || is_key_async_down(VK_RCONTROL);
+                let has_alt = ALT_DOWN.load(Ordering::SeqCst)
+                    || is_key_async_down(VK_MENU)
+                    || is_key_async_down(VK_LMENU)
+                    || is_key_async_down(VK_RMENU);
+                let has_shift = SHIFT_DOWN.load(Ordering::SeqCst)
+                    || is_key_async_down(VK_SHIFT)
+                    || is_key_async_down(VK_LSHIFT)
+                    || is_key_async_down(VK_RSHIFT);
+
+                let win_match = (req_mods & 1 != 0) == has_win;
+                let ctrl_match = (req_mods & 2 != 0) == has_ctrl;
+                let alt_match = (req_mods & 4 != 0) == has_alt;
+                let shift_match = (req_mods & 8 != 0) == has_shift;
+
+                if win_match && ctrl_match && alt_match && shift_match && vk == req_key {
+                    unsafe {
+                        if let Some(ref tx) = HOOK_TX {
+                            let _ = tx.send(());
+                        }
+                    }
+                    // Suppress default Windows Clipboard if Win key is part of the shortcut
+                    if has_win {
+                        unsafe {
+                            keybd_event(0xFF, 0, 0, 0);
+                            keybd_event(0xFF, 0, KEYEVENTF_KEYUP, 0);
+                        }
+                        return 1;
+                    }
+                }
+            }
+        }
+        unsafe { CallNextHookEx(std::ptr::null_mut(), code, w_param, l_param) }
+    }
+
+    pub fn start_hook(on_trigger: impl Fn() + Send + 'static) {
+        let (tx, rx) = channel();
+        unsafe {
+            HOOK_TX = Some(tx);
+        }
+
+        std::thread::spawn(move || {
+            while let Ok(()) = rx.recv() {
+                on_trigger();
+            }
+        });
+
+        std::thread::spawn(|| unsafe {
+            let h_mod = windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null());
+            let hook = SetWindowsHookExW(
+                WH_KEYBOARD_LL,
+                Some(hook_proc),
+                h_mod,
+                0,
+            );
+            if hook.is_null() {
+                eprintln!("Failed to register low level keyboard hook");
+                return;
+            }
+
+            let mut msg: MSG = std::mem::zeroed();
+            while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+
+            UnhookWindowsHookEx(hook);
+        });
+    }
+}
+
 // Commands
 #[tauri::command]
 fn get_history(state: State<'_, AppState>) -> Result<Vec<ClipItem>, String> {
     let history = state.history.lock().map_err(|e| e.to_string())?;
     Ok(history.clone())
+}
+
+#[tauri::command]
+fn get_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
+    let settings = state.settings.lock().map_err(|e| e.to_string())?;
+    Ok(settings.clone())
 }
 
 #[tauri::command]
@@ -147,22 +346,23 @@ fn copy_item(
             let _ = cb.set_text(&text_to_copy);
         }
 
+        // Hide flyout immediately so focus returns to the target window
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.hide();
+        }
+
         // Auto paste if requested (Windows)
         #[cfg(windows)]
         if auto_paste {
             std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::thread::sleep(std::time::Duration::from_millis(120));
                 unsafe {
                     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
                         keybd_event, KEYEVENTF_KEYUP, VK_CONTROL,
                     };
-                    // Ctrl down
                     keybd_event(VK_CONTROL as u8, 0, 0, 0);
-                    // 'V' down
                     keybd_event(b'V', 0, 0, 0);
-                    // 'V' up
                     keybd_event(b'V', 0, KEYEVENTF_KEYUP, 0);
-                    // Ctrl up
                     keybd_event(VK_CONTROL as u8, 0, KEYEVENTF_KEYUP, 0);
                 }
             });
@@ -211,25 +411,30 @@ fn toggle_pause(state: State<'_, AppState>) -> Result<bool, String> {
 fn save_settings(
     settings: AppSettings,
     state: State<'_, AppState>,
-    app: AppHandle,
+    #[allow(unused_variables)] app: AppHandle,
 ) -> Result<(), String> {
     let mut cur = state.settings.lock().map_err(|e| e.to_string())?;
-    let old_hotkey = cur.hotkey.clone();
     *cur = settings.clone();
     save_settings_to_disk(&state.data_dir, &settings);
 
-    // Re-register hotkey if changed
-    if old_hotkey != settings.hotkey {
+    #[cfg(windows)]
+    {
+        win_hook::set_hotkey(&settings.hotkey);
+    }
+
+    #[cfg(not(windows))]
+    {
         let _ = app.global_shortcut().unregister_all();
         if let Ok(shortcut) = settings.hotkey.parse::<Shortcut>() {
             let app_handle = app.clone();
             let _ = app.global_shortcut().on_shortcut(shortcut, move |_app, _sc, event| {
                 if event.state == ShortcutState::Pressed {
-                    toggle_window_visibility(&app_handle);
+                    show_clipboard_flyout(&app_handle);
                 }
             });
         }
     }
+
     Ok(())
 }
 
@@ -241,22 +446,59 @@ fn hide_window(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-fn toggle_window_visibility(app: &AppHandle) {
+// Shows the clipboard window floating in bottom-right above taskbar (like Windows native clipboard)
+fn show_clipboard_flyout(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         if window.is_visible().unwrap_or(false) {
             let _ = window.hide();
-        } else {
-            let _ = window.show();
-            let _ = window.unminimize();
-            let _ = window.set_focus();
+            return;
         }
+
+        // Position window anchored to bottom-right corner
+        if let Ok(Some(monitor)) = window.current_monitor() {
+            let screen_size = monitor.size();
+            let scale = monitor.scale_factor();
+            let win_width = (360.0 * scale) as i32;
+            let win_height = (520.0 * scale) as i32;
+            let margin_x = (16.0 * scale) as i32;
+            let margin_y = (60.0 * scale) as i32; // above taskbar
+
+            let x = screen_size.width as i32 - win_width - margin_x;
+            let y = screen_size.height as i32 - win_height - margin_y;
+
+            let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(x, y)));
+        }
+
+        let _ = window.set_always_on_top(true);
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+
+        #[cfg(windows)]
+        {
+            if let Ok(hwnd) = window.hwnd() {
+                unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd.0 as _);
+                    windows_sys::Win32::UI::WindowsAndMessaging::BringWindowToTop(hwnd.0 as _);
+                }
+            }
+        }
+
+        let _ = window.emit("window-opened", ());
     }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+    #[allow(unused_mut)]
+    let mut builder = tauri::Builder::default();
+
+    #[cfg(not(windows))]
+    {
+        builder = builder.plugin(tauri_plugin_global_shortcut::Builder::new().build());
+    }
+
+    builder
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -266,14 +508,12 @@ pub fn run() {
                 )?;
             }
 
-            // Get or create app data directory
             let data_dir = app
                 .path()
                 .app_data_dir()
                 .unwrap_or_else(|_| PathBuf::from("./data"));
             let _ = fs::create_dir_all(&data_dir);
 
-            // Load persisted data
             let history = load_history_from_disk(&data_dir);
             let settings = load_settings_from_disk(&data_dir);
 
@@ -285,7 +525,7 @@ pub fn run() {
             };
             app.manage(app_state);
 
-            // Auto-hide window on blur (like native Windows Clipboard)
+            // Auto-hide window on blur (just like Windows 11 Clipboard)
             if let Some(main_window) = app.get_webview_window("main") {
                 let window_clone = main_window.clone();
                 main_window.on_window_event(move |event| {
@@ -295,20 +535,19 @@ pub fn run() {
                 });
             }
 
-            // Setup System Tray
+            // System Tray Setup
             let show_item = MenuItem::with_id(app, "show", "Show Clipboard (Win+V)", true, None::<&str>)?;
-            let clear_item = MenuItem::with_id(app, "clear", "Clear Unpinned History", true, None::<&str>)?;
+            let clear_item = MenuItem::with_id(app, "clear", "Clear History", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit ClipStore", true, None::<&str>)?;
-
             let tray_menu = Menu::with_items(app, &[&show_item, &clear_item, &quit_item])?;
 
             let _tray = TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
-                .tooltip("ClipStore - Clipboard Manager (Win+V)")
+                .tooltip("ClipStore - Clipboard History")
                 .menu(&tray_menu)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => {
-                        toggle_window_visibility(app);
+                        show_clipboard_flyout(app);
                     }
                     "clear" => {
                         if let Some(state) = app.try_state::<AppState>() {
@@ -331,40 +570,37 @@ pub fn run() {
                         ..
                     } = event
                     {
-                        toggle_window_visibility(tray.app_handle());
+                        show_clipboard_flyout(tray.app_handle());
                     }
                 })
                 .build(app)?;
 
-            // Register global shortcut
             let app_handle = app.handle().clone();
-            let hotkey_str = settings.hotkey.clone();
 
-            // Try configured shortcut (e.g. Super+V)
-            let registered = if let Ok(shortcut) = hotkey_str.parse::<Shortcut>() {
+            // Set up Windows low-level hook for Win+V and other shortcuts
+            #[cfg(windows)]
+            {
+                win_hook::set_hotkey(&settings.hotkey);
                 let handle_clone = app_handle.clone();
-                app.global_shortcut().on_shortcut(shortcut, move |_app, _sc, event| {
-                    if event.state == ShortcutState::Pressed {
-                        toggle_window_visibility(&handle_clone);
-                    }
-                }).is_ok()
-            } else {
-                false
-            };
+                win_hook::start_hook(move || {
+                    show_clipboard_flyout(&handle_clone);
+                });
+            }
 
-            // If Super+V fails (e.g. Windows reserved hotkey), also register fallback universal Ctrl+Shift+V
-            if !registered || hotkey_str != "CommandOrControl+Shift+V" {
-                if let Ok(fallback) = "CommandOrControl+Shift+V".parse::<Shortcut>() {
-                    let handle_clone = app_handle.clone();
-                    let _ = app.global_shortcut().on_shortcut(fallback, move |_app, _sc, event| {
+            // Linux fallback shortcut handling
+            #[cfg(not(windows))]
+            {
+                let handle_clone = app_handle.clone();
+                if let Ok(sc) = settings.hotkey.parse::<Shortcut>() {
+                    let _ = app.global_shortcut().on_shortcut(sc, move |_app, _sc, event| {
                         if event.state == ShortcutState::Pressed {
-                            toggle_window_visibility(&handle_clone);
+                            show_clipboard_flyout(&handle_clone);
                         }
                     });
                 }
             }
 
-            // Spawn background clipboard polling thread
+            // Background clipboard poller thread
             let thread_app = app_handle.clone();
             std::thread::spawn(move || {
                 let mut last_clipboard_text = String::new();
@@ -376,7 +612,6 @@ pub fn run() {
                     }
                 };
 
-                // Seed last clipboard text
                 if let Ok(initial_text) = cb.get_text() {
                     last_clipboard_text = initial_text;
                 }
@@ -411,13 +646,11 @@ pub fn run() {
                                         .map(|s| s.capacity)
                                         .unwrap_or(100);
 
-                                    // Deduplicate: if exists, update timestamp and move to top
                                     if let Some(pos) = history.iter().position(|i| i.text == text) {
                                         history[pos].timestamp = now;
                                     } else {
                                         history.insert(0, new_item.clone());
                                         if history.len() > capacity {
-                                            // Evict oldest unpinned
                                             if let Some(oldest_idx) = history
                                                 .iter()
                                                 .rposition(|i| !i.pinned)
@@ -440,6 +673,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_history,
+            get_settings,
             copy_item,
             delete_item,
             toggle_pin,
